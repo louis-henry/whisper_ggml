@@ -26,7 +26,7 @@ android {
     namespace "com.devac.whisper_ggml"
     ndkVersion "29.0.13113456"
 
-    compileSdk 34
+    compileSdk 36
 
     // Invoke the shared CMake build with the Android Gradle Plugin.
     externalNativeBuild {

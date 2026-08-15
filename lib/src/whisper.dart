@@ -6,7 +6,6 @@ import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
 import 'package:universal_io/io.dart';
 import 'package:whisper_ggml/src/models/whisper_model.dart';
-import 'package:whisper_ggml/src/whisper_audio_convert.dart';
 
 import 'models/requests/release_model_request.dart';
 import 'models/requests/transcribe_request.dart';
@@ -17,7 +16,6 @@ import 'models/responses/whisper_version_response.dart';
 import 'models/whisper_dto.dart';
 
 export 'models/_models.dart';
-export 'whisper_audio_convert.dart';
 
 /// Native request type
 typedef WReqNative = Pointer<Utf8> Function(Pointer<Utf8> body);
@@ -83,16 +81,9 @@ class Whisper {
             ? null
             : NativeCallable<Void Function(Int32)>.listener(onProgress);
     try {
-      final WhisperAudioConvert converter = WhisperAudioConvert(
-        audioInput: File(transcribeRequest.audio),
-        audioOutput: File('${transcribeRequest.audio}.wav'),
-      );
-
-      final File? convertedFile = await converter.convert();
-
-      final TranscribeRequest req = transcribeRequest.copyWith(
-        audio: convertedFile?.path ?? transcribeRequest.audio,
-      );
+      // Fork: FFmpeg conversion removed. `audio` must already be a
+      // 16 kHz mono WAV file; the live-session path is unaffected.
+      final TranscribeRequest req = transcribeRequest;
 
       final Map<String, dynamic> result = await _request(
         whisperRequest: TranscribeRequestDto.fromTranscribeRequest(
