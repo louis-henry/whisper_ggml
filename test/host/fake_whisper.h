@@ -42,6 +42,16 @@ void fake_set_trailing_fragment(bool on);
 // exists. Slack is in centiseconds.
 void fake_set_timestamp_slack(int cs);
 
+// Whisper hallucinates over trailing silence — it repeats earlier text or
+// invents phrases. whisper_flutter_plus.cpp says so in its own comments and
+// trims every decode to STREAM_VOICE_PAD past the last voiced sample
+// specifically to avoid it. Modelled here so that trim can be tested: a decode
+// handed more than this much silence after the last speech emits a word nobody
+// said. Generous on purpose, so an ordinary decode carrying a little trailing
+// silence never trips it.
+constexpr int kHallucinationSilenceSamples = 16000;   // 1s
+extern const char *const kHallucinatedWord;
+
 // Every decode the code under test asked for, in order. Offsets are in
 // samples, absolute across the session, recovered from the audio itself, so
 // this is a true record of which audio was decoded and which never was.

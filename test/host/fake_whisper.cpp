@@ -64,6 +64,13 @@ std::vector<Run> split_runs(const float *pcm, int n)
 void build_segments(const float *pcm, int n)
 {
     g_segments.clear();
+
+    // whisper.cpp declines anything under 100ms outright, returning success
+    // with no segments at all ("input is too short - %d ms < 100 ms", and it
+    // is a warning, not an error). A fake that cheerfully decodes 20ms would
+    // let a caller believe a fragment that short is safely transcribed.
+    if (n < WHISPER_SAMPLE_RATE / 10) return;
+
     const std::vector<Run> runs = split_runs(pcm, n);
 
     FakeDecode record{-1, -1, false, n};
@@ -117,6 +124,15 @@ void build_segments(const float *pcm, int n)
                                        speech.back().second.length);
         g_segments.push_back({text, seg_start_cs, reported_end(true_end, seg_start_cs)});
     }
+
+    // Trailing silence past the last voiced sample: whisper fills it with text
+    // nobody said.
+    const int last_voiced_end =
+        speech.back().second.offset + speech.back().second.length;
+    if (n - last_voiced_end > kHallucinationSilenceSamples) {
+        g_segments.push_back({std::string(" ") + kHallucinatedWord,
+                              cs_at(last_voiced_end), cs_at(n)});
+    }
 }
 
 // Set WHISPER_HOST_TEST_TRACE=1 to see the shape of every decode. Worth doing
@@ -134,6 +150,8 @@ void trace_decode(int n_samples)
 }
 
 }  // namespace
+
+const char *const kHallucinatedWord = "wGHOST";
 
 void fake_set_segment_chunks(int chunks) { g_segment_chunks = chunks; }
 void fake_set_timestamp_slack(int cs) { g_timestamp_slack_cs = cs; }
