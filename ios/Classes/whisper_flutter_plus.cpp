@@ -825,11 +825,36 @@ static json stream_run_inference()
             (int64_t)STREAM_KEEP_SAMPLES * 100 / WHISPER_SAMPLE_RATE;
         const int64_t soft_cutoff_cs = decode_end_cs - keep_cs;
 
+        const int n_segments = whisper_full_n_segments(g_stream.ctx);
+
+        if (n_segments == 0) {
+            // Silence filled a whole window without tripping the
+            // min-decode-length guard above - typically a mid-session
+            // pause with suppress_non_speech_tokens on (whisper_ggml_port
+            // .dart), which suppresses the [BLANK_AUDIO] segment whisper
+            // would otherwise emit here. There is no text to lose, so
+            // erase the whole window outright: leaving it in place, as an
+            // earlier version of this did, decodes this identical silent
+            // slice forever, the same shape of deadlock this file already
+            // fixed once for the single-segment case - confirmed live
+            // (independent review, host harness): the buffer grows
+            // unboundedly while committed output freezes, and
+            // stream_stop's single decode call then only ever sees the
+            // leading window, permanently losing everything spoken after
+            // the pause.
+            g_stream.pcmf32.erase(g_stream.pcmf32.begin(),
+                                  g_stream.pcmf32.begin() + n_decode);
+            g_stream.n_transcribed = 0;
+            g_stream.n_voiced -= std::min(g_stream.n_voiced, n_decode);
+            g_stream.last_text.clear();
+            result["text"] = g_stream.committed + g_stream.last_text;
+            return result;
+        }
+
         std::string safe_text;
         std::string held_text;
         int64_t committed_through_cs = 0;
         bool any_committed = false;
-        const int n_segments = whisper_full_n_segments(g_stream.ctx);
         for (int i = 0; i < n_segments; ++i) {
             std::string seg_text = whisper_full_get_segment_text(g_stream.ctx, i);
             if (i == 0) {
@@ -858,15 +883,48 @@ static json stream_run_inference()
         // the single segment if there is only one) guarantees the window
         // always advances; strip_duplicate_prefix on the next segment's
         // head is the safety net against the boundary landing mid-word.
-        if (!any_committed && n_segments > 0) {
+        if (!any_committed) {
             for (int i = 0; i < n_segments - 1; ++i) {
-                safe_text += whisper_full_get_segment_text(g_stream.ctx, i);
+                std::string seg_text = whisper_full_get_segment_text(g_stream.ctx, i);
+                if (i == 0) {
+                    // The MULTI-segment fallback re-gathers text from
+                    // segment 0 outside the main loop above, and this
+                    // call was missing here in an earlier version - the
+                    // one place a boundary word could be permanently
+                    // duplicated, because it is the one commit path that
+                    // skipped its own safety net (independent review).
+                    seg_text = strip_duplicate_prefix(g_stream.committed, seg_text);
+                }
+                safe_text += seg_text;
                 committed_through_cs = whisper_full_get_segment_t1(g_stream.ctx, i);
                 any_committed = true;
             }
             if (!any_committed) {
-                // Exactly one segment spanning the whole window: commit it
-                // in full rather than deadlock.
+                // Exactly one segment spanning the whole window: commit
+                // its text in full rather than deadlock.
+                //
+                // Erases through the FULL decode (decode_end_cs), not the
+                // keep margin (soft_cutoff_cs) - tried the latter first,
+                // on the reasoning that it should preserve the same
+                // continuity margin the normal path gets and let
+                // strip_duplicate_prefix absorb the resulting overlap.
+                // Measured, not assumed: it does not. Unlike the normal
+                // path, where soft_cutoff_cs is compared against real
+                // segment END timestamps (natural pauses), a single
+                // segment spanning the whole window has no such break -
+                // soft_cutoff_cs lands at an arbitrary point inside
+                // continuous, ongoing speech, likely mid-word or
+                // mid-phrase. Kept and re-decoded alone next cycle, that
+                // fragment loses the acoustic context it needs and can
+                // come back as outright hallucinated text (observed live:
+                // "is" inserted where nothing was said), not a genuine
+                // repeat - which strip_duplicate_prefix cannot catch,
+                // since it is not a repeat of any real word, just wrong
+                // ones. That is worse than the plain risk this was meant
+                // to fix (one boundary word truncated), so it stays
+                // reverted: continuous speech can still lose a word right
+                // at this boundary, same as before this whole
+                // investigation, but it does not corrupt text.
                 safe_text = strip_duplicate_prefix(
                     g_stream.committed,
                     whisper_full_get_segment_text(g_stream.ctx, 0));
@@ -879,18 +937,13 @@ static json stream_run_inference()
         }
 
         g_stream.last_text = held_text;
-        if (any_committed) {
-            g_stream.committed += safe_text;
-            size_t n_erase = (size_t)(committed_through_cs * WHISPER_SAMPLE_RATE / 100);
-            n_erase = std::min(n_erase, n_decode);
-            g_stream.pcmf32.erase(g_stream.pcmf32.begin(),
-                                  g_stream.pcmf32.begin() + n_erase);
-            g_stream.n_transcribed = n_decode - n_erase;
-            g_stream.n_voiced -= std::min(g_stream.n_voiced, n_erase);
-        }
-        // n_segments == 0 (silence somehow reached this far without
-        // tripping the min-decode-length guard above): nothing to do:
-        // n_transcribed stays at n_decode, waiting for real new audio.
+        g_stream.committed += safe_text;
+        size_t n_erase = (size_t)(committed_through_cs * WHISPER_SAMPLE_RATE / 100);
+        n_erase = std::min(n_erase, n_decode);
+        g_stream.pcmf32.erase(g_stream.pcmf32.begin(),
+                              g_stream.pcmf32.begin() + n_erase);
+        g_stream.n_transcribed = n_decode - n_erase;
+        g_stream.n_voiced -= std::min(g_stream.n_voiced, n_erase);
     } else {
         std::string text;
         const int n_segments = whisper_full_n_segments(g_stream.ctx);
@@ -1080,12 +1133,34 @@ extern "C"
         }
 
         // Cover voiced audio that arrived after the last run; a silent
-        // tail is dropped rather than decoded.
-        const size_t n_tail = std::min(g_stream.pcmf32.size(),
-                                       g_stream.n_voiced + STREAM_VOICE_PAD);
-        if (g_stream.n_voiced > g_stream.n_transcribed &&
-            n_tail >= (size_t)WHISPER_SAMPLE_RATE / 2) {
+        // tail is dropped rather than decoded. Drained in a loop, not a
+        // single call: n_decode is capped at stream_window_samples() per
+        // call, and the buffer routinely holds more than one window's
+        // worth here - a cycle only fires once new audio exceeds
+        // stream_step_samples(), so pcmf32 commonly grows to close to a
+        // full window plus a step before the next trigger. A single call
+        // would only ever process the front of that, and pcmf32.clear()
+        // below would then permanently discard whatever it never reached
+        // - the closing words of the session, made permanent by
+        // ADR-0007's one-way commit (independent review, host harness:
+        // stop swept across a full decode cycle loses closing words in
+        // roughly 1 in 17 stop timings). Each iteration below is
+        // guaranteed to make forward progress after the n_segments==0 fix
+        // above, so this always terminates; the iteration cap is a
+        // backstop against a case neither of us has thought of, not a
+        // limit expected to bind.
+        for (int drain = 0; drain < 64; ++drain) {
+            const size_t n_tail = std::min(g_stream.pcmf32.size(),
+                                           g_stream.n_voiced + STREAM_VOICE_PAD);
+            if (!(g_stream.n_voiced > g_stream.n_transcribed &&
+                  n_tail >= (size_t)WHISPER_SAMPLE_RATE / 2)) {
+                break;
+            }
+            const size_t before = g_stream.pcmf32.size();
             stream_run_inference();
+            if (g_stream.pcmf32.size() >= before) {
+                break;
+            }
         }
 
         jsonResult["@type"] = "streamFinal";
