@@ -891,6 +891,15 @@ static json stream_run_inference()
         // Discard what this loop found and fall through to the
         // guaranteed-progress fallback below exactly as if nothing had
         // committed.
+        //
+        // Defensive, not dead: whisper does not itself emit a zero-length
+        // segment (t1 == t0), so this guard has no known live trigger and
+        // therefore no test - the host harness's fake produced one only by
+        // its own bug (a timestamp clamp that could return a segment's own
+        // start), and fixing that fake removed the only thing that ever
+        // exercised this branch. Keep it anyway: the alternative is a real
+        // decoder someday returning that shape and this file silently
+        // freezing again with nothing here to catch it.
         if (any_committed && committed_through_cs == 0) {
             safe_text.clear();
             held_text.clear();
