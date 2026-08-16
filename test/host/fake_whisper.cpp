@@ -35,11 +35,22 @@ void trace_decode(int n_samples);
 int64_t cs_at(int sample_offset) { return (int64_t)sample_offset * 100 / kSampleRate; }
 
 // A segment end as whisper would report it: near the true end, not exactly on
-// it. Never before the segment's own start, so ordering still holds.
+// it. Always strictly AFTER the segment's own start — whisper does not emit
+// zero-length segments, and a fake that does feeds the code under test an
+// input reality never produces.
+//
+// This clamp returned start_cs once. A zero-length segment makes the boundary
+// commit text while erasing nothing, so the window cannot advance: it looked
+// exactly like the freeze defect, against code where that was already fixed.
+// Worse, once the code grew a guard for zero progress, the degenerate segment
+// stopped failing and started passing THROUGH that guard — so the two tests
+// named for the no-speech-window case silently stopped reaching it, and kept
+// reporting green. A fake misleads by being harsher than reality as well as
+// kinder.
 int64_t reported_end(int64_t true_end_cs, int64_t start_cs)
 {
     const int64_t reported = true_end_cs - g_timestamp_slack_cs;
-    return reported > start_cs ? reported : start_cs;
+    return reported > start_cs ? reported : start_cs + 1;
 }
 
 std::vector<Run> split_runs(const float *pcm, int n)
