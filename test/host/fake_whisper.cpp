@@ -35,11 +35,20 @@ void trace_decode(int n_samples);
 int64_t cs_at(int sample_offset) { return (int64_t)sample_offset * 100 / kSampleRate; }
 
 // A segment end as whisper would report it: near the true end, not exactly on
-// it. Never before the segment's own start, so ordering still holds.
+// it. Always strictly after the segment's own start — whisper does not emit
+// zero-length segments, and a fake that does feeds the code under test an
+// input reality never produces.
+//
+// This clamp was wrong once, returning start_cs. A zero-length segment makes
+// the boundary commit text while erasing nothing, so the window cannot
+// advance and the session appears frozen — a real-looking failure, against
+// correct code, that cost a round of investigation. A fake misleads by being
+// harsher than reality as well as kinder: an impossible input produces a
+// defect nobody needs to fix, which costs as much trust as a missed one.
 int64_t reported_end(int64_t true_end_cs, int64_t start_cs)
 {
     const int64_t reported = true_end_cs - g_timestamp_slack_cs;
-    return reported > start_cs ? reported : start_cs;
+    return reported > start_cs ? reported : start_cs + 1;
 }
 
 std::vector<Run> split_runs(const float *pcm, int n)
