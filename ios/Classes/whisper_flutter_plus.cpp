@@ -11,6 +11,7 @@
 #include <thread>
 #include <mutex>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <vector>
 
@@ -637,8 +638,25 @@ static void stream_dispose_ctx()
     g_stream.park_on_stop = false;
 }
 
-static const size_t STREAM_STEP_SAMPLES   = (size_t)(1.5 * WHISPER_SAMPLE_RATE);
-static const size_t STREAM_COMMIT_SAMPLES = (size_t)(25.0 * WHISPER_SAMPLE_RATE);
+// A fixed-size sliding window (docs: window-management investigation,
+// 2026-08-16): the decode window is capped at STREAM_WINDOW_SAMPLES on
+// every call, for the whole session, not just within one commit cycle -
+// unlike the previous design, where the window grew from 0 up to a
+// 25-second commit threshold before resetting, so per-call decode cost
+// grew across each cycle even though the ceiling was bounded. Capping
+// every call keeps per-call cost roughly constant for the whole session.
+// Starting point taken from whisper.cpp's own examples/stream/stream.cpp
+// sliding-window defaults (step_ms/length_ms/keep_ms); tuned from there
+// against the fixture harness's plateau benchmark, not assumed correct.
+static const size_t STREAM_STEP_SAMPLES   = (size_t)(3.0 * WHISPER_SAMPLE_RATE);
+static const size_t STREAM_WINDOW_SAMPLES = (size_t)(10.0 * WHISPER_SAMPLE_RATE);
+// Audio kept across a window boundary rather than discarded, so a word
+// spoken right at the boundary is not decoded with silence butted up
+// against it on one side. Text-level de-dup (stream_run_inference) is
+// still what actually prevents that kept audio's words from being
+// committed twice - this alone is not a correctness guarantee, matching
+// upstream's own "quick-n-dirty" caveat about relying on overlap alone.
+static const size_t STREAM_KEEP_SAMPLES   = (size_t)(0.2 * WHISPER_SAMPLE_RATE);
 // Decode this much audio past the last voiced sample (trailing consonants).
 static const size_t STREAM_VOICE_PAD      = (size_t)(0.2 * WHISPER_SAMPLE_RATE);
 
@@ -649,10 +667,79 @@ static size_t stream_step_samples()
     return g_stream.test_step_samples != 0
         ? g_stream.test_step_samples : STREAM_STEP_SAMPLES;
 }
-static size_t stream_commit_samples()
+static size_t stream_window_samples()
 {
     return g_stream.test_window_samples != 0
-        ? g_stream.test_window_samples : STREAM_COMMIT_SAMPLES;
+        ? g_stream.test_window_samples : STREAM_WINDOW_SAMPLES;
+}
+
+static std::string normalize_word(const std::string &w)
+{
+    std::string out;
+    for (unsigned char c : w) {
+        if (std::isalnum(c)) out += (char)std::tolower(c);
+    }
+    return out;
+}
+
+static std::vector<std::string> tokenize_words(const std::string &s)
+{
+    std::vector<std::string> words;
+    std::string cur;
+    for (unsigned char c : s) {
+        if (std::isspace(c)) {
+            if (!cur.empty()) { words.push_back(cur); cur.clear(); }
+        } else {
+            cur += (char)c;
+        }
+    }
+    if (!cur.empty()) words.push_back(cur);
+    return words;
+}
+
+// Strips leading words of `text` that duplicate the trailing words of
+// `tail`, comparing case-insensitively and ignoring punctuation.
+//
+// A window boundary's audio cut is not always word-exact, and whisper can
+// re-emit the word straddling it in both the just-committed decode and the
+// next one - the kept-audio overlap (STREAM_KEEP_SAMPLES) does not prevent
+// this, it only makes sure that word's audio is present to decode at all;
+// upstream's own examples/stream/stream.cpp calls its keep_ms a mitigation
+// for word-boundary issues, not a guarantee, and this is exactly that gap.
+// Checked against real words rather than raw audio because the fixture
+// harness's own comments note whisper's punctuation and casing move
+// between builds and quantizations, so an exact-position audio check would
+// be more fragile than this.
+static std::string strip_duplicate_prefix(const std::string &tail, const std::string &text)
+{
+    const std::vector<std::string> tail_words = tokenize_words(tail);
+    const std::vector<std::string> text_words = tokenize_words(text);
+    if (tail_words.empty() || text_words.empty()) return text;
+
+    const size_t max_check = std::min({tail_words.size(), text_words.size(), (size_t)5});
+    size_t overlap = 0;
+    for (size_t n = max_check; n >= 1; --n) {
+        bool match = true;
+        for (size_t i = 0; i < n; ++i) {
+            if (normalize_word(tail_words[tail_words.size() - n + i]) !=
+                normalize_word(text_words[i])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) { overlap = n; break; }
+    }
+    if (overlap == 0) return text;
+
+    // Skip `overlap` whitespace-delimited words from the front, preserving
+    // whatever spacing/punctuation the model produced in what remains
+    // rather than re-joining tokens.
+    size_t pos = 0;
+    for (size_t skipped = 0; skipped < overlap && pos < text.size(); ++skipped) {
+        while (pos < text.size() && std::isspace((unsigned char)text[pos])) pos++;
+        while (pos < text.size() && !std::isspace((unsigned char)text[pos])) pos++;
+    }
+    return text.substr(pos);
 }
 
 // Runs whisper_full over the current window. Caller must hold g_stream.mutex.
@@ -665,6 +752,19 @@ static json stream_run_inference()
     wparams.print_realtime   = false;
     wparams.print_progress   = false;
     wparams.print_timestamps = false;
+    // NOTE (measured, not kept - see the window-management investigation):
+    // upstream's stream.cpp sets this true in its own sliding-window mode,
+    // but doing the same here defeats this function's own segment-based
+    // commit boundary: forced to one segment per call, the per-segment
+    // soft-cutoff test can never find a safe segment, so every boundary
+    // falls through to the force-commit fallback and erases the whole
+    // window every time - zero audio overlap survives, leaving
+    // strip_duplicate_prefix as the only correctness net instead of one of
+    // two. Measured against the fixture (synchronous feed, wall clock over
+    // the full 11s clip): 9862ms without this, 10336ms with it - a single
+    // run each, within normal run-to-run variance, but no speedup either,
+    // so not worth the correctness downside above.
+    // wparams.single_segment = true;
     wparams.translate        = g_stream.translate;
     wparams.language         = g_stream.language.c_str();
     wparams.n_threads        = g_stream.n_threads;
@@ -675,9 +775,16 @@ static json stream_run_inference()
     }
 
     // Trim trailing silence from the decode window; decoding it makes
-    // whisper hallucinate (repeats or invented phrases).
-    const size_t n_decode =
-        std::min(g_stream.pcmf32.size(), g_stream.n_voiced + STREAM_VOICE_PAD);
+    // whisper hallucinate (repeats or invented phrases). Also cap at the
+    // window: never decode more than stream_window_samples() of audio in
+    // one call, so per-call cost stays bounded for the whole session, not
+    // just within one commit cycle (see the window-size comment above).
+    const size_t window_samples = stream_window_samples();
+    const size_t n_decode = std::min({
+        g_stream.pcmf32.size(),
+        g_stream.n_voiced + STREAM_VOICE_PAD,
+        window_samples,
+    });
     if (n_decode < (size_t)WHISPER_SAMPLE_RATE / 2) {
         result["text"] = g_stream.committed + g_stream.last_text;
         return result;
@@ -690,22 +797,111 @@ static json stream_run_inference()
         return result;
     }
 
-    std::string text;
-    const int n_segments = whisper_full_n_segments(g_stream.ctx);
-    for (int i = 0; i < n_segments; ++i) {
-        text += whisper_full_get_segment_text(g_stream.ctx, i);
-    }
-
-    g_stream.last_text = text;
     g_stream.n_transcribed = n_decode;
 
-    if (n_decode >= stream_commit_samples()) {
-        g_stream.committed += text;
-        g_stream.last_text.clear();
-        g_stream.pcmf32.erase(g_stream.pcmf32.begin(),
-                              g_stream.pcmf32.begin() + n_decode);
-        g_stream.n_transcribed = 0;
-        g_stream.n_voiced -= std::min(g_stream.n_voiced, n_decode);
+    if (n_decode >= window_samples) {
+        // Boundary reached. A segment counts as safe to commit only if it
+        // ends at least STREAM_KEEP_SAMPLES before the end of this decode -
+        // segments that close, whatever their own duration, keep the same
+        // kind of continuity margin upstream's keep_ms gives at a fixed
+        // audio boundary, without assuming every held segment is short.
+        // `committed` is append-only from here on, exactly like the
+        // Dart-side TranscriptAssembler's settled words: this is where
+        // that one-way commitment actually happens, so it must not fire
+        // on a segment whose audio has not stopped changing yet.
+        //
+        // Critically, the audio erased below must match the text
+        // committed below exactly - erasing a fixed amount independent of
+        // which segments were actually committed was the bug an earlier
+        // version of this had: held text whose audio spans more than the
+        // fixed keep window got silently discarded once that audio left
+        // the buffer, because it was never re-decodable again and nothing
+        // carried it forward. Erasing exactly through the last *committed*
+        // segment's end guarantees every held segment's audio is still in
+        // the buffer next cycle.
+        const int64_t decode_end_cs =
+            (int64_t)n_decode * 100 / WHISPER_SAMPLE_RATE;
+        const int64_t keep_cs =
+            (int64_t)STREAM_KEEP_SAMPLES * 100 / WHISPER_SAMPLE_RATE;
+        const int64_t soft_cutoff_cs = decode_end_cs - keep_cs;
+
+        std::string safe_text;
+        std::string held_text;
+        int64_t committed_through_cs = 0;
+        bool any_committed = false;
+        const int n_segments = whisper_full_n_segments(g_stream.ctx);
+        for (int i = 0; i < n_segments; ++i) {
+            std::string seg_text = whisper_full_get_segment_text(g_stream.ctx, i);
+            if (i == 0) {
+                seg_text = strip_duplicate_prefix(g_stream.committed, seg_text);
+            }
+            const int64_t t1 = whisper_full_get_segment_t1(g_stream.ctx, i);
+            if (t1 <= soft_cutoff_cs) {
+                safe_text += seg_text;
+                committed_through_cs = t1;
+                any_committed = true;
+            } else {
+                held_text += seg_text;
+            }
+        }
+
+        // No segment cleared the keep margin (whisper decoded this whole
+        // window as one continuous phrase with no internal break far
+        // enough from the end). Erasing nothing here does NOT make this
+        // a harmless no-op cycle: n_decode is capped at window_samples,
+        // so the very next trigger would decode the identical leading
+        // slice of pcmf32 again and hit the same "nothing safe" outcome
+        // forever - audio keeps arriving, but the window never advances
+        // to see it. Confirmed live: the fixture stalled permanently
+        // exactly here before this fallback existed. Falling back to
+        // "commit everything but the last segment" (or force-committing
+        // the single segment if there is only one) guarantees the window
+        // always advances; strip_duplicate_prefix on the next segment's
+        // head is the safety net against the boundary landing mid-word.
+        if (!any_committed && n_segments > 0) {
+            for (int i = 0; i < n_segments - 1; ++i) {
+                safe_text += whisper_full_get_segment_text(g_stream.ctx, i);
+                committed_through_cs = whisper_full_get_segment_t1(g_stream.ctx, i);
+                any_committed = true;
+            }
+            if (!any_committed) {
+                // Exactly one segment spanning the whole window: commit it
+                // in full rather than deadlock.
+                safe_text = strip_duplicate_prefix(
+                    g_stream.committed,
+                    whisper_full_get_segment_text(g_stream.ctx, 0));
+                committed_through_cs = decode_end_cs;
+                any_committed = true;
+                held_text.clear();
+            } else {
+                held_text = whisper_full_get_segment_text(g_stream.ctx, n_segments - 1);
+            }
+        }
+
+        g_stream.last_text = held_text;
+        if (any_committed) {
+            g_stream.committed += safe_text;
+            size_t n_erase = (size_t)(committed_through_cs * WHISPER_SAMPLE_RATE / 100);
+            n_erase = std::min(n_erase, n_decode);
+            g_stream.pcmf32.erase(g_stream.pcmf32.begin(),
+                                  g_stream.pcmf32.begin() + n_erase);
+            g_stream.n_transcribed = n_decode - n_erase;
+            g_stream.n_voiced -= std::min(g_stream.n_voiced, n_erase);
+        }
+        // n_segments == 0 (silence somehow reached this far without
+        // tripping the min-decode-length guard above): nothing to do:
+        // n_transcribed stays at n_decode, waiting for real new audio.
+    } else {
+        std::string text;
+        const int n_segments = whisper_full_n_segments(g_stream.ctx);
+        for (int i = 0; i < n_segments; ++i) {
+            std::string seg_text = whisper_full_get_segment_text(g_stream.ctx, i);
+            if (i == 0) {
+                seg_text = strip_duplicate_prefix(g_stream.committed, seg_text);
+            }
+            text += seg_text;
+        }
+        g_stream.last_text = text;
     }
 
     result["text"] = g_stream.committed + g_stream.last_text;
