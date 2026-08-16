@@ -3,6 +3,7 @@
 #define DR_WAV_IMPLEMENTATION
 #include "whisper/examples/dr_wav.h"
 
+#include <TargetConditionals.h>
 #include <cmath>
 #include <fstream>
 #include <cstdio>
@@ -275,7 +276,20 @@ json transcribe(json jsonBody)
     if (ctx == nullptr)
     {
         struct whisper_context_params cparams = whisper_context_default_params();
-        cparams.use_gpu = true; // Metal (prototype, metal-enable branch): falls back to CPU if init fails
+#if TARGET_OS_SIMULATOR
+        // ggml's Metal sources carry no simulator guard of their own, so
+        // the simulator's Metal-to-host translation shim (MTLSimDevice)
+        // gets the real init call and dies inside it during model-weight
+        // upload (confirmed: EXC_BREAKPOINT, "API Misuse", reproduced live
+        // - see the window-management investigation). No such shim exists
+        // on a device, so this is simulator-only; guarding it here
+        // restores CPU-only simulator builds, which is what the fixture
+        // harness (integration_test/whisper_fixture_test.dart) actually
+        // needs to run on simulator at all.
+        cparams.use_gpu = false;
+#else
+        cparams.use_gpu = true; // falls back to CPU if init fails
+#endif
         ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
     }
     if (ctx == nullptr)
@@ -749,7 +763,12 @@ extern "C"
         }
         if (g_stream.ctx == nullptr) {
             whisper_context_params cparams = whisper_context_default_params();
-            cparams.use_gpu = true; // Metal (prototype, metal-enable branch): falls back to CPU if init fails
+#if TARGET_OS_SIMULATOR
+            // See the guard on the same field in transcribe() above.
+            cparams.use_gpu = false;
+#else
+            cparams.use_gpu = true; // falls back to CPU if init fails
+#endif
             g_stream.ctx = whisper_init_from_file_with_params(model.c_str(), cparams);
         }
         if (g_stream.ctx == nullptr) {

@@ -26,11 +26,11 @@ A new Flutter FFI plugin project.
   # source at runtime on first use, so no .metallib resource bundle is
   # needed. Upstream generates the merge and the .s file with CMake
   # add_custom_command; CocoaPods has no equivalent, so prepare_command
-  # reproduces the exact same three-step sed/echo sequence CMake's
-  # ggml/src/ggml-metal/CMakeLists.txt uses, once, at `pod install` time
-  # — before source_files below is evaluated, which is why the generated
-  # ggml-metal-embed.s and ggml-metal-embed.metal can already be listed
-  # in that glob.
+  # reproduces the merge upstream's ggml/src/ggml-metal/CMakeLists.txt does
+  # (the header-merge sed step is faithful; the .incbin path below is not —
+  # see that comment), once, at `pod install` time — before source_files
+  # below is evaluated, which is why the generated ggml-metal-embed.s and
+  # ggml-metal-embed.metal can already be listed in that glob.
   s.prepare_command = <<-CMD
     set -e
     METAL_DIR="Classes/whisper/ggml/src/ggml-metal"
@@ -48,7 +48,16 @@ A new Flutter FFI plugin project.
       echo '.section __DATA,__ggml_metallib'
       echo '.globl _ggml_metallib_start'
       echo '_ggml_metallib_start:'
-      echo '.incbin "ggml-metal-embed.metal"'
+      # A bare filename here only resolves if the assembler's own CWD
+      # happens to be this directory when Xcode invokes it — it does NOT
+      # resolve relative to this .s file. Upstream's CMake generator
+      # writes an absolute path for exactly this reason; matching that
+      # here, baked in at `pod install` time via $(pwd) (this script's
+      # CWD is the podspec's own directory, Classes/'s parent), makes
+      # resolution self-contained rather than an accidental byproduct of
+      # HEADER_SEARCH_PATHS below, which exists for C header lookup and
+      # says nothing about being load-bearing for this too.
+      echo ".incbin \\"$(pwd)/${METAL_DIR}/ggml-metal-embed.metal\\""
       echo '.globl _ggml_metallib_end'
       echo '_ggml_metallib_end:'
     } > "${METAL_DIR}/ggml-metal-embed.s"
