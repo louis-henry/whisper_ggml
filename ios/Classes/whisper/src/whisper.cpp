@@ -4164,7 +4164,7 @@ int whisper_model_type(struct whisper_context * ctx) {
 }
 
 const char * whisper_backend_name(struct whisper_context * ctx) {
-    if (ctx->state == nullptr || ctx->state->backends.empty()) {
+    if (ctx == nullptr || ctx->state == nullptr || ctx->state->backends.empty()) {
         return "none";
     }
     // backends[0] is the primary compute backend whisper_backend_init()
