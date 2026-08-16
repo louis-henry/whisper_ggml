@@ -68,6 +68,13 @@ A new Flutter FFI plugin project.
   }
   s.library = 'c++'
   s.frameworks = 'Accelerate', 'Foundation', 'Metal', 'MetalKit'
+  # ggml's Metal .m files (ggml-metal-device.m, ggml-metal-context.m) are
+  # written against manual retain/release — explicit `[obj release]` calls
+  # and unbridged void*<->id casts for its C-interop pattern, matching how
+  # upstream's own build compiles them. This pod had no Objective-C source
+  # before Metal, so nothing here previously relied on ARC; every other
+  # vendored file is .cpp/.c, where this flag is a no-op.
+  s.compiler_flags = '-fno-objc-arc'
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
