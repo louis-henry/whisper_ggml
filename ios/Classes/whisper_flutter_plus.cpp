@@ -1199,13 +1199,29 @@ extern "C"
         // or two of a session - is silently dropped rather than merely
         // delayed, because nothing ever calls stream_run_inference again
         // to pick it up. Flush whatever remains directly, bypassing the
-        // window/keep-margin machinery entirely: that machinery exists to
-        // protect audio a *future* decode would still need, and there is
-        // no future decode.
+        // window/keep-margin machinery: that machinery exists to protect
+        // audio a *future* decode would still need, and there is no future
+        // decode.
+        //
+        // Still capped at n_voiced + STREAM_VOICE_PAD, same as every other
+        // decode in this file, and NOT the whole remaining buffer - an
+        // earlier version of this passed pcmf32.size() outright, on the
+        // reasoning above, and that reasoning does not extend this far.
+        // The window/keep-margin machinery protects audio a future decode
+        // needs; the VOICE_PAD trim protects something unrelated - never
+        // handing whisper unbounded trailing silence, which nothing ever
+        // erases because silence never triggers a decode. Passing the
+        // whole buffer at stop reintroduced exactly the failure mode
+        // Finding 4 was reverted to avoid: whisper hallucinating words
+        // over the untrimmed tail, appended straight to the one-way
+        // `committed` string (independent review, host harness: 12 of 452
+        // speech/pause combinations invented a word nobody said).
         if (g_stream.n_voiced > g_stream.n_transcribed && !g_stream.pcmf32.empty()) {
             whisper_full_params wparams = stream_make_wparams();
+            const size_t n_flush = std::min(g_stream.pcmf32.size(),
+                                            g_stream.n_voiced + STREAM_VOICE_PAD);
             if (whisper_full(g_stream.ctx, wparams, g_stream.pcmf32.data(),
-                             (int)g_stream.pcmf32.size()) == 0) {
+                             (int)n_flush) == 0) {
                 std::string text;
                 const int n_segments = whisper_full_n_segments(g_stream.ctx);
                 for (int i = 0; i < n_segments; ++i) {
