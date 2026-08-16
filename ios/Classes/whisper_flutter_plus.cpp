@@ -743,11 +743,11 @@ static std::string strip_duplicate_prefix(const std::string &tail, const std::st
 }
 
 // Runs whisper_full over the current window. Caller must hold g_stream.mutex.
-static json stream_run_inference()
+// Shared by every whisper_full() call this file makes against the live
+// session: the ordinary sliding-window decode and the final flush at
+// stream_stop alike. Kept in one place so the two can never drift apart.
+static whisper_full_params stream_make_wparams()
 {
-    json result;
-    result["@type"] = "streamPartial";
-
     whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     wparams.print_realtime   = false;
     wparams.print_progress   = false;
@@ -773,6 +773,15 @@ static json stream_run_inference()
     if (!g_stream.prompt.empty()) {
         wparams.initial_prompt = g_stream.prompt.c_str();
     }
+    return wparams;
+}
+
+static json stream_run_inference()
+{
+    json result;
+    result["@type"] = "streamPartial";
+
+    whisper_full_params wparams = stream_make_wparams();
 
     // Trim trailing silence from the decode window; decoding it makes
     // whisper hallucinate (repeats or invented phrases). Also cap at the
@@ -868,6 +877,24 @@ static json stream_run_inference()
             } else {
                 held_text += seg_text;
             }
+        }
+
+        // A segment can clear the soft-cutoff test above and still commit
+        // nothing real: t1 == 0 means whisper reported this segment as
+        // ending at (or clamped to) the very front of the decode window,
+        // so committing "through" that timestamp erases zero samples and
+        // the window does not advance even though any_committed is true.
+        // Confirmed live (independent review, host harness): a residual
+        // fragment sitting right at the buffer's leading edge reproduces
+        // this identically every cycle - the same frozen-window symptom
+        // as the n_segments == 0 case above, through a different path.
+        // Discard what this loop found and fall through to the
+        // guaranteed-progress fallback below exactly as if nothing had
+        // committed.
+        if (any_committed && committed_through_cs == 0) {
+            safe_text.clear();
+            held_text.clear();
+            any_committed = false;
         }
 
         // No segment cleared the keep margin (whisper decoded this whole
@@ -1160,6 +1187,36 @@ extern "C"
             stream_run_inference();
             if (g_stream.pcmf32.size() >= before) {
                 break;
+            }
+        }
+
+        // The loop above shares stream_run_inference with the ongoing
+        // session, and that function declines to decode fewer than half a
+        // second of audio - the right call mid-session, where waiting for
+        // more audio next call is free, but wrong here: there is no next
+        // call. Confirmed live (independent review, host harness): a
+        // trailing fragment under that floor - as little as the last word
+        // or two of a session - is silently dropped rather than merely
+        // delayed, because nothing ever calls stream_run_inference again
+        // to pick it up. Flush whatever remains directly, bypassing the
+        // window/keep-margin machinery entirely: that machinery exists to
+        // protect audio a *future* decode would still need, and there is
+        // no future decode.
+        if (g_stream.n_voiced > g_stream.n_transcribed && !g_stream.pcmf32.empty()) {
+            whisper_full_params wparams = stream_make_wparams();
+            if (whisper_full(g_stream.ctx, wparams, g_stream.pcmf32.data(),
+                             (int)g_stream.pcmf32.size()) == 0) {
+                std::string text;
+                const int n_segments = whisper_full_n_segments(g_stream.ctx);
+                for (int i = 0; i < n_segments; ++i) {
+                    std::string seg_text = whisper_full_get_segment_text(g_stream.ctx, i);
+                    if (i == 0) {
+                        seg_text = strip_duplicate_prefix(g_stream.committed, seg_text);
+                    }
+                    text += seg_text;
+                }
+                g_stream.committed += text;
+                g_stream.last_text.clear();
             }
         }
 
