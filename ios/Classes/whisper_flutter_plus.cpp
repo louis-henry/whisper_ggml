@@ -275,7 +275,7 @@ json transcribe(json jsonBody)
     if (ctx == nullptr)
     {
         struct whisper_context_params cparams = whisper_context_default_params();
-        cparams.use_gpu = false; // CPU-only build
+        cparams.use_gpu = true; // Metal (prototype, metal-enable branch): falls back to CPU if init fails
         ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
     }
     if (ctx == nullptr)
@@ -748,7 +748,7 @@ extern "C"
         }
         if (g_stream.ctx == nullptr) {
             whisper_context_params cparams = whisper_context_default_params();
-            cparams.use_gpu = false; // CPU-only build
+            cparams.use_gpu = true; // Metal (prototype, metal-enable branch): falls back to CPU if init fails
             g_stream.ctx = whisper_init_from_file_with_params(model.c_str(), cparams);
         }
         if (g_stream.ctx == nullptr) {

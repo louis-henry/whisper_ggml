@@ -17,7 +17,44 @@ A new Flutter FFI plugin project.
   s.source           = {
     :git => 'https://github.com/sk3llo/whisper_ggml'
   }
-  s.source_files = 'Classes/**/*.{cpp,c,h,hpp}'
+
+  # ggml's Metal backend (Classes/whisper/ggml/src/ggml-metal/, vendored from
+  # whisper.cpp v1.9.1 — matching GGML_VERSION below) uses
+  # GGML_METAL_EMBED_LIBRARY: the .metal shader source is merged with two
+  # headers and embedded as raw bytes in a hand-written assembly (.s) file's
+  # __DATA,__ggml_metallib section, via .incbin — Metal compiles it from
+  # source at runtime on first use, so no .metallib resource bundle is
+  # needed. Upstream generates the merge and the .s file with CMake
+  # add_custom_command; CocoaPods has no equivalent, so prepare_command
+  # reproduces the exact same three-step sed/echo sequence CMake's
+  # ggml/src/ggml-metal/CMakeLists.txt uses, once, at `pod install` time
+  # — before source_files below is evaluated, which is why the generated
+  # ggml-metal-embed.s and ggml-metal-embed.metal can already be listed
+  # in that glob.
+  s.prepare_command = <<-CMD
+    set -e
+    METAL_DIR="Classes/whisper/ggml/src/ggml-metal"
+    COMMON_H="Classes/whisper/ggml/src/ggml-common.h"
+    sed -e "/__embed_ggml-common.h__/r ${COMMON_H}" \
+        -e "/__embed_ggml-common.h__/d" \
+        < "${METAL_DIR}/ggml-metal.metal" \
+        > "${METAL_DIR}/ggml-metal-embed.metal.tmp"
+    sed -e "/#include \\"ggml-metal-impl.h\\"/r ${METAL_DIR}/ggml-metal-impl.h" \
+        -e "/#include \\"ggml-metal-impl.h\\"/d" \
+        < "${METAL_DIR}/ggml-metal-embed.metal.tmp" \
+        > "${METAL_DIR}/ggml-metal-embed.metal"
+    rm -f "${METAL_DIR}/ggml-metal-embed.metal.tmp"
+    {
+      echo '.section __DATA,__ggml_metallib'
+      echo '.globl _ggml_metallib_start'
+      echo '_ggml_metallib_start:'
+      echo '.incbin "ggml-metal-embed.metal"'
+      echo '.globl _ggml_metallib_end'
+      echo '_ggml_metallib_end:'
+    } > "${METAL_DIR}/ggml-metal-embed.s"
+  CMD
+
+  s.source_files = 'Classes/**/*.{cpp,c,h,hpp,m,s}'
   # Only whisper.h is public; the ggml tree has duplicate header basenames
   # (common.h, quants.h) that collide when flattened into the framework.
   s.public_header_files = 'Classes/whisper/include/whisper.h'
@@ -30,19 +67,22 @@ A new Flutter FFI plugin project.
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++20',
   }
   s.library = 'c++'
-  s.frameworks = 'Accelerate'
+  s.frameworks = 'Accelerate', 'Foundation', 'Metal', 'MetalKit'
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
-    # whisper.cpp v1.9.1 (CPU backend) include roots
+    # whisper.cpp v1.9.1 include roots. CPU backend stays compiled in as
+    # ggml's own fallback path (registered after Metal in
+    # ggml-backend-reg.cpp); Metal is additive, not a replacement.
     'HEADER_SEARCH_PATHS' => [
       '"$(PODS_TARGET_SRCROOT)/Classes/whisper/include"',
       '"$(PODS_TARGET_SRCROOT)/Classes/whisper/ggml/include"',
       '"$(PODS_TARGET_SRCROOT)/Classes/whisper/ggml/src"',
       '"$(PODS_TARGET_SRCROOT)/Classes/whisper/ggml/src/ggml-cpu"',
+      '"$(PODS_TARGET_SRCROOT)/Classes/whisper/ggml/src/ggml-metal"',
       '"$(PODS_TARGET_SRCROOT)/Classes/whisper/src"',
     ].join(' '),
-    'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) GGML_USE_CPU=1 GGML_USE_ACCELERATE=1 ACCELERATE_NEW_LAPACK=1 ACCELERATE_LAPACK_ILP64=1 GGML_VERSION=\"1.9.1\" GGML_COMMIT=\"whisper.cpp-v1.9.1\" WHISPER_VERSION=\"1.9.1\"',
+    'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) GGML_USE_CPU=1 GGML_USE_ACCELERATE=1 ACCELERATE_NEW_LAPACK=1 ACCELERATE_LAPACK_ILP64=1 GGML_USE_METAL=1 GGML_METAL_EMBED_LIBRARY=1 GGML_VERSION=\"1.9.1\" GGML_COMMIT=\"whisper.cpp-v1.9.1\" WHISPER_VERSION=\"1.9.1\"',
     # keep inference usable in debug builds
     'GCC_OPTIMIZATION_LEVEL' => '3',
   }
