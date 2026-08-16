@@ -4163,6 +4163,17 @@ int whisper_model_type(struct whisper_context * ctx) {
     return ctx->model.type;
 }
 
+const char * whisper_backend_name(struct whisper_context * ctx) {
+    if (ctx->state == nullptr || ctx->state->backends.empty()) {
+        return "none";
+    }
+    // backends[0] is the primary compute backend whisper_backend_init()
+    // resolved: the GPU device if use_gpu was set and one was found and
+    // initialized successfully, CPU otherwise (see whisper_backend_init_gpu's
+    // fallback).
+    return ggml_backend_name(ctx->state->backends[0]);
+}
+
 const char *whisper_model_type_readable(struct whisper_context * ctx) {
     switch (ctx->model.type) {
     case e_model::MODEL_TINY:

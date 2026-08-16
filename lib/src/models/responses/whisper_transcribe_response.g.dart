@@ -7,20 +7,24 @@ part of 'whisper_transcribe_response.dart';
 // **************************************************************************
 
 _WhisperTranscribeResponse _$WhisperTranscribeResponseFromJson(
-        Map<String, dynamic> json) =>
-    _WhisperTranscribeResponse(
-      type: json['@type'] as String,
-      text: json['text'] as String,
-      segments: (json['segments'] as List<dynamic>?)
-          ?.map((e) =>
-              WhisperTranscribeSegment.fromJson(e as Map<String, dynamic>))
+  Map<String, dynamic> json,
+) => _WhisperTranscribeResponse(
+  type: json['@type'] as String,
+  text: json['text'] as String,
+  segments:
+      (json['segments'] as List<dynamic>?)
+          ?.map(
+            (e) => WhisperTranscribeSegment.fromJson(e as Map<String, dynamic>),
+          )
           .toList(),
-    );
+  backend: json['backend'] as String?,
+);
 
 Map<String, dynamic> _$WhisperTranscribeResponseToJson(
-        _WhisperTranscribeResponse instance) =>
-    <String, dynamic>{
-      '@type': instance.type,
-      'text': instance.text,
-      'segments': instance.segments,
-    };
+  _WhisperTranscribeResponse instance,
+) => <String, dynamic>{
+  '@type': instance.type,
+  'text': instance.text,
+  'segments': instance.segments,
+  'backend': instance.backend,
+};

@@ -449,6 +449,15 @@ extern "C" {
     // Print system information
     WHISPER_API const char * whisper_print_system_info(void);
 
+    // Name of the compute backend this context actually resolved to at
+    // whisper_init time (e.g. "Metal", "CPU") — the backend ggml's device
+    // scheduler selected and initialized, not merely what was compiled in.
+    // whisper_backend_init_gpu() falls back to CPU whenever GPU device
+    // discovery or initialization fails, so this reflects that outcome
+    // rather than the GGML_USE_METAL compile flag. Returns "none" if ctx
+    // has no state (should not happen for a successfully initialized ctx).
+    WHISPER_API const char * whisper_backend_name(struct whisper_context * ctx);
+
     ////////////////////////////////////////////////////////////////////////////
 
     // Available sampling strategies

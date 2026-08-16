@@ -490,6 +490,7 @@ json transcribe(json jsonBody)
         }
     }
     jsonResult["text"] = text_result;
+    jsonResult["backend"] = whisper_backend_name(ctx);
 
     release_ctx();
     return jsonResult;
@@ -762,6 +763,7 @@ extern "C"
         g_stream.park_on_stop = borrowed || keep_model_loaded;
 
         jsonResult["@type"] = "streamStarted";
+        jsonResult["backend"] = whisper_backend_name(g_stream.ctx);
         return jsonToChar(jsonResult);
     }
 

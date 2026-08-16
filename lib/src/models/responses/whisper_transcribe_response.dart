@@ -15,6 +15,12 @@ abstract class WhisperTranscribeResponse with _$WhisperTranscribeResponse {
     required String text,
     @JsonKey(name: 'segments')
     required List<WhisperTranscribeSegment>? segments,
+    // The compute backend this transcription actually resolved to (e.g.
+    // "Metal", "CPU") — the backend ggml's device scheduler initialized,
+    // not merely what the build compiled in. Null on platforms/builds that
+    // don't report it (e.g. Android, or a fork commit before this field
+    // existed).
+    String? backend,
   }) = _WhisperTranscribeResponse;
 
   const WhisperTranscribeResponse._();

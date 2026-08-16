@@ -29,6 +29,13 @@ class WhisperLiveSession {
   final Completer<String> _final = Completer<String>();
   bool _stopped = false;
 
+  /// The compute backend this session's model actually resolved to at load
+  /// time (e.g. "Metal", "CPU") — the backend ggml's device scheduler
+  /// initialized, not merely what the build compiled in. Set once
+  /// [startWhisperLiveSession] returns; null on platforms/builds that don't
+  /// report it (e.g. Android, or a fork commit before this field existed).
+  String? backend;
+
   /// Progressively refined transcripts of the audio fed so far. Each event
   /// replaces the previous one (it is the full text, not a delta).
   Stream<String> get partials => _partials.stream;
@@ -100,6 +107,7 @@ Future<WhisperLiveSession> startWhisperLiveSession({
       case 'ready':
         ready.complete(msg[1] as SendPort);
       case 'started':
+        session.backend = msg.length > 1 ? msg[1] as String? : null;
         started.complete();
       case 'partial':
         lastText = msg[1] as String;
@@ -213,7 +221,7 @@ void _liveWorker(SendPort toMain) {
         if (result['@type'] == 'error') {
           toMain.send(['error', result['message']]);
         } else {
-          toMain.send(const ['started']);
+          toMain.send(['started', result['backend']]);
         }
       case 'feed':
         Uint8List bytes = msg[1] as Uint8List;
