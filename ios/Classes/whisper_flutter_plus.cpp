@@ -597,6 +597,13 @@ struct whisper_stream_state
     // Park ctx into g_model_cache when the session ends: set when the
     // session asked for keep_model_loaded or borrowed a parked context.
     bool park_on_stop = false;
+    // Test-only window/step overrides (0 = use the production default).
+    // Set from an optional stream_start field never sent by production Dart
+    // code (startWhisperLiveSession does not expose it) - existed so a test
+    // can make an 11-second fixture cross several window boundaries instead
+    // of needing a multi-minute one. See whisper_ggml's own test suite.
+    size_t test_window_samples = 0;
+    size_t test_step_samples = 0;
     std::mutex mutex;
 };
 
@@ -634,6 +641,19 @@ static const size_t STREAM_STEP_SAMPLES   = (size_t)(1.5 * WHISPER_SAMPLE_RATE);
 static const size_t STREAM_COMMIT_SAMPLES = (size_t)(25.0 * WHISPER_SAMPLE_RATE);
 // Decode this much audio past the last voiced sample (trailing consonants).
 static const size_t STREAM_VOICE_PAD      = (size_t)(0.2 * WHISPER_SAMPLE_RATE);
+
+// Resolved per-session: the test override when stream_start set one,
+// otherwise the production default above. Caller must hold g_stream.mutex.
+static size_t stream_step_samples()
+{
+    return g_stream.test_step_samples != 0
+        ? g_stream.test_step_samples : STREAM_STEP_SAMPLES;
+}
+static size_t stream_commit_samples()
+{
+    return g_stream.test_window_samples != 0
+        ? g_stream.test_window_samples : STREAM_COMMIT_SAMPLES;
+}
 
 // Runs whisper_full over the current window. Caller must hold g_stream.mutex.
 static json stream_run_inference()
@@ -679,7 +699,7 @@ static json stream_run_inference()
     g_stream.last_text = text;
     g_stream.n_transcribed = n_decode;
 
-    if (n_decode >= STREAM_COMMIT_SAMPLES) {
+    if (n_decode >= stream_commit_samples()) {
         g_stream.committed += text;
         g_stream.last_text.clear();
         g_stream.pcmf32.erase(g_stream.pcmf32.begin(),
@@ -696,7 +716,12 @@ extern "C"
 {
     // body: {"model": path, "language": "en", "threads": 4,
     //        "is_translate": false, "initial_prompt": "...",
-    //        "keep_model_loaded": false}
+    //        "keep_model_loaded": false,
+    //        "test_window_ms": 0, "test_step_ms": 0}
+    // test_window_ms/test_step_ms are test-only (0 = production default):
+    // never sent by startWhisperLiveSession, present so a test can shrink
+    // the window/step thresholds and make a short fixture cross several
+    // boundaries.
     char *stream_start(char *body)
     {
         std::lock_guard<std::mutex> lock(g_stream.mutex);
@@ -720,6 +745,18 @@ extern "C"
         g_stream.noise_floor = 0.005f;
         g_stream.committed.clear();
         g_stream.last_text.clear();
+        // Reset every session: a leftover override from a previous test
+        // session must never silently apply to the next one.
+        g_stream.test_window_samples = 0;
+        g_stream.test_step_samples = 0;
+        if (jsonBody.contains("test_window_ms") && jsonBody["test_window_ms"].is_number()) {
+            g_stream.test_window_samples =
+                (size_t)(jsonBody["test_window_ms"].get<double>() * WHISPER_SAMPLE_RATE / 1000.0);
+        }
+        if (jsonBody.contains("test_step_ms") && jsonBody["test_step_ms"].is_number()) {
+            g_stream.test_step_samples =
+                (size_t)(jsonBody["test_step_ms"].get<double>() * WHISPER_SAMPLE_RATE / 1000.0);
+        }
 
         std::string model;
         bool keep_model_loaded = false;
@@ -826,7 +863,7 @@ extern "C"
         // Run only when new *voiced* audio arrived — silence alone
         // never triggers a decode.
         if (g_stream.n_voiced > g_stream.n_transcribed &&
-            g_stream.pcmf32.size() - g_stream.n_transcribed >= STREAM_STEP_SAMPLES) {
+            g_stream.pcmf32.size() - g_stream.n_transcribed >= stream_step_samples()) {
             return jsonToChar(stream_run_inference());
         }
 

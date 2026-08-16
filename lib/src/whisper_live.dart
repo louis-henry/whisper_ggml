@@ -78,6 +78,12 @@ class WhisperLiveSession {
 /// multi-second load — see `TranscribeRequest.keepModelLoaded` for the
 /// memory trade-off. A session also borrows an already-parked model
 /// automatically when the path matches, and returns it on stop.
+///
+/// [testWindowOverrideMs] and [testStepOverrideMs] are test-only: null (the
+/// default) leaves the production window/step thresholds untouched. They
+/// exist so a test can shrink those thresholds and make a short fixture
+/// cross several window boundaries instead of needing a multi-minute one.
+/// No production call site should ever set these.
 Future<WhisperLiveSession> startWhisperLiveSession({
   required String modelPath,
   String lang = 'en',
@@ -89,6 +95,8 @@ Future<WhisperLiveSession> startWhisperLiveSession({
   double gateRmsMin = 0.0015,
   double gateVoiceRatio = 2.5,
   double gateNoiseFloorCap = 0.01,
+  int? testWindowOverrideMs,
+  int? testStepOverrideMs,
 }) async {
   final ReceivePort fromWorker = ReceivePort();
   final Isolate worker =
@@ -153,6 +161,8 @@ Future<WhisperLiveSession> startWhisperLiveSession({
       'gate_floor_cap': gateNoiseFloorCap,
       if (initialPrompt != null && initialPrompt.isNotEmpty)
         'initial_prompt': initialPrompt,
+      if (testWindowOverrideMs != null) 'test_window_ms': testWindowOverrideMs,
+      if (testStepOverrideMs != null) 'test_step_ms': testStepOverrideMs,
     }),
   ]);
 
